@@ -1,0 +1,558 @@
+
+# 实现RF的并行生成
+PrandomForest <- function(n,x,y,ntree,rp,imp){#n:核数；x:因变量；y:自变量；ntree:每个核需要生成的树个数
+  library('doParallel')                         #rp:是否采用有放回的采样，imp:是否计算特征找重要性
+  library('randomForest')
+  cl <- makeCluster(n)
+  registerDoParallel(cl)
+  RFModel<- foreach(ntree=rep(ntree,n ), 
+                    .combine=combine,
+                    .packages='randomForest') %dopar%
+    randomForest(y=y,x=x,ntree=ntree,replace=rp,importance=imp,keep.forest=F)
+  stopCluster(cl)
+  return(RFModel)
+}
+
+#RF特征重要性排列
+rfimprank <- function(RFModel){
+  importance <- RFModel$importance
+  feature <- rownames(importance)
+  index.tmp <- order(importance, decreasing = T)
+  feature.importance <- cbind(feature[index.tmp[1:length(feature)]],importance[index.tmp[1:length(feature)]])
+  colnames(feature.importance)<-c('feature','weights')
+  return(feature.importance)
+}
+
+#
+zero_one <- function(data){
+  tem <- data.frame(data)
+  colnames(tem)[1] = 'var1'
+  tem[tem$var1>0,]<-1#增长
+  tem[tem$var1<=0,]<-0#非增
+  tem <- as.vector(tem$var1)
+  return(tem)
+}
+#input the train set and test set，plot the ROC
+rocPlot <- function(model,train,test,title=''){
+  library("ROCR")
+  pred <- predict(model,train)
+  pred <- as.vector(pred)-as.vector(train$空腹血糖.2014)#生成预测向量 
+  tem <-as.vector(train$血糖)-as.vector(train$空腹血糖.2014)
+  tem <- zero_one(tem)
+  pred <- prediction(pred, tem)
+  perf <- performance(pred, "tpr", "fpr" )
+  perf.auc <- performance(pred, "auc" )
+  plot(perf,col=rainbow(10))
+  text(1,0.2,paste("Training AUC = ",substr(as.character(perf.auc@y.values),1,6),sep=""),pos=2,cex=1.5)
+  box(lwd=4)
+  
+  pred <- predict(model,test)
+  pred <- as.vector(pred)-as.vector(test$空腹血糖.2014)#生成预测向量 
+  tem <-as.vector(test$血糖)-as.vector(test$空腹血糖.2014)
+  tem <- zero_one(tem)
+  pred <- prediction(pred, tem)
+  perf <- performance(pred, "tpr", "fpr" )
+  perf.auc <- performance(pred, "auc" )
+  lines(x=unlist(perf@x.values),y=unlist(perf@y.values),col='green')
+  title(main=title)
+  
+  text(1,0.15,paste("Testing AUC = ",substr(as.character(perf.auc@y.values),1,6),sep=""),pos=2,cex=1.5)
+  rmse <- rmse(as.vector(predict(model,test))-as.vector(test$血糖))
+  mae <- mae(as.vector(predict(model,test))-as.vector(test$血糖))
+  text(1,0.1,paste("RMSE = ",substr(as.character(rmse),1,6),sep=""),pos=2,cex=1.5)
+  text(1,0.05,paste("MAE = ",substr(as.character(mae),1,6),sep=""),pos=2,cex=1.5)
+}
+
+
+#plot the ROC for population with specific age group  
+age.roc <- function(df,down=0,up=130){
+  x <- df[which(df$Customer_sAge.2012 <= up & down <= df$Customer_sAge.2012),]
+  ind <- sample(nrow(x),round(nrow(x)*0.8))
+  train <- x[ind,]
+  test <- x[-ind,]
+  rfModel <- PrandomForest(3,train[,1:(ncol(train)-1)],train[,ncol(train)],1000,F,F)
+  rocPlot(rfModel,test,title='rfplot')
+}
+#plot the ROC for population with specific gender
+sex.roc <- function(df,sex){
+  x <- df[which(df$Customer_sSex.2013 ==sex),]
+  x.Customer_sSex.2013 <- NULL
+  ind <- sample(nrow(x),round(nrow(x)*0.8))
+  train <- x[ind,]
+  test <- x[-ind,]
+  rfModel <- PrandomForest(3,train[,1:(ncol(train)-1)],train[,ncol(train)],1000,F,F)
+  rocPlot(rfModel,test,title='rfplot')
+}
+
+#calculate the mean of AUC for population with specific age group  
+age.mean<-function(df,down=0,up=130){
+  w <-0
+  x <- df[which(df$年龄 <= up & down <= df$年龄),]
+  
+  rf.pred <- rf.mean(x)
+  print("mean of randomforest")
+  print(rf.pred)
+  svm.pred <- svm.mean(x)
+  print("mean of svm")
+  print(svm.pred)
+}
+#calculate the mean of AUC for population with specific gender
+sex.mean <- function(df,sex){
+  w <-0
+  x <- df[which(df$Customer_sSex.2011 ==sex),]
+  x$Customer_sSex.2011 <- NULL
+  
+  rf.pred <- rf.mean(x)
+  print("mean of randomforest")
+  print(rf.pred)
+  svm.pred <- svm.mean(x)
+  print("mean of svm")
+  print(svm.pred)
+}
+
+#calculate the mean of 10 times AUC by SVM
+svm.mean <- function(x){
+  library('e1071')
+  w<-0
+  for(i in 1:10){
+    ind <- sample(nrow(x),round(nrow(x)*(2/3)))#生成训练集，测试集，默认2:1比例
+    train <- x[ind,]
+    test <- x[-ind,]
+    
+    svmModel <- svm(血糖~.,data=train,type='eps-regression',kernel='radial')#训练模型使用eps-regression,核采用radial，其余参数默认
+    
+    pred <- predict(svmModel,test)
+    pred <- as.vector(pred)-as.vector(test$空腹血糖.2013)#生成预测向量
+    
+    tem <- data.frame(as.vector(test$血糖)-as.vector(test$空腹血糖.2013))#生成第三年到第二年的血糖变化0-1向量
+    colnames(tem)[1] = 'var1'
+    tem[tem$var1>0,]<-1#增长
+    tem[tem$var1<=0,]<-0#非增
+    tem <- as.vector(tem)
+    
+    
+    pred <- prediction(pred, tem)
+    perf <- performance(pred, "tpr", "fpr" )
+    perf.auc <- performance(pred, "auc" )
+    w <- w+unlist(perf.auc@y.values)
+  }
+  return(w/10)
+}
+#calculate the mean of 10 times AUC by randomforest
+rf.mean <- function(x){
+  library('randomForest')
+  w<-0
+  for(i in 1:10){
+    ind <- sample(nrow(x),round(nrow(x)*(2/3)))#生成训练集，测试集，默认2:1比例
+    train <- x[ind,]
+    test <- x[-ind,]
+    
+    source('PrandomForest')
+    rfModel <- PrandomForest(3,train[,1:(ncol(train)-1)],train[,ncol(train)],1000,F,F)
+    
+    pred <- predict(rfModel,test)
+    pred <- as.vector(pred)-as.vector(test$空腹血糖.2013)#生成预测向量
+    
+    tem <- data.frame(as.vector(test$血糖)-as.vector(test$空腹血糖.2013))#生成第三年到第二年的血糖变化0-1向量
+    colnames(tem)[1] = 'var1'
+    tem[tem$var1>0,]<-1#增长
+    tem[tem$var1<=0,]<-0#非增
+    tem <- as.vector(tem)
+    
+    pred <- prediction(pred, tem)
+    perf <- performance(pred, "tpr", "fpr" )
+    perf.auc <- performance(pred, "auc" )
+    w <- w+unlist(perf.auc@y.values)
+  }
+  return(w/10)
+}
+#calculate the mean of AUC for population with specific gender and age group
+age_sex.mean <- function(df,sex,down=0,up=130){
+  x <- df[which(df$年龄 <= up & down <= df$年龄 & df$性别 == sex ),]
+  x$性别 <- NULL
+  
+  rf.pred <- rf.mean(x)
+  print("mean of randomforest")
+  print(rf.pred)
+  svm.pred <- svm.mean(x)
+  print("mean of svm")
+  print(svm.pred)
+}
+# calculate the score for data preparing for prediction
+# function ScoreNormalization: transfer score in [0,1] to [0,100]
+ScoreNormalization <- function(x, class, x_new, precision=0.0001){
+  if(max(c(x,x_new))>1 | min(c(x,x_new))<0) stop("Input score for normalization is wrong! Should be 0 to 1\t")
+  N <- round(1/precision)
+  accuracy <- rep(NA,N)
+  tmp_calculate <- function(i, x, class, N) length(which(x >= i/N & class == 1))/length(which(x >= i/N))
+  accuracy <- sapply(1:N, tmp_calculate, x=x,class=class,N=N)
+  limit <- c(0,20,30,40,50,60,70,80,90,100)
+  value <- c(0, rep(Inf,10))
+  value[2] <- min(which(accuracy >= 0.20))/N
+  value[3] <- min(which(accuracy >= 0.30))/N
+  value[4] <- min(which(accuracy >= 0.40))/N
+  value[5] <- min(which(accuracy >= 0.50))/N
+  value[6] <- min(which(accuracy >= 0.60))/N
+  value[7] <- min(which(accuracy >= 0.70))/N
+  value[8] <- min(which(accuracy >= 0.80))/N
+  value[9] <- min(which(accuracy >= 0.90))/N
+  index <- min(which(value == Inf))
+  score_new <- rep(NA, length(x_new))
+  for(i in 2:index){
+    if(value[i]==value[i-1]) value[i] <- value[i] + precision/10# aviod NA output
+    score_new[which(value[i-1]<=x_new & x_new <= value[i])] <- 
+      (x_new[which(value[i-1]<=x_new & x_new <= value[i])] - value[i-1])/(min(1+precision/10,value[i])-value[i-1])*
+      (limit[i]-limit[i-1]) + limit[i-1]
+  }
+  return(score_new)
+}
+#notmslizing the values
+normalize<- function(x){
+  x[which(x < (-8))] <- (-8)
+  x[which(x > 8)] <- 8
+  return((x-(-8))/16)
+}
+#将函数转化
+
+validate <- function(model,test){
+  ind <- sample(nrow(test),round(nrow(test)/2))
+  test1 <- test[ind,]
+  test2 <- test[-ind,]
+  
+  pred <- predict(model,test1)
+  pred1 <- normalize(as.vector(pred)-as.vector(test1$空腹血糖.2013))
+  pred2 <- predict(model,test2)
+  pred2 <- normalize(as.vector(pred2)-as.vector(test2$空腹血糖.2013))
+  
+  test1 <- data.frame(as.vector(test1$血糖)-as.vector(test1$空腹血糖.2013))#生成第三年到第二年的血糖变化0-1向量
+  colnames(test1)[1] = "var1"
+  test1[test1$var1>0,]<-1#增长
+  test1[test1$var1<=0,]<-0#非增
+  test1 <- as.vector(test1)
+  
+  
+  
+  score <- ScoreNormalization(pred1,test1,pred2)
+  return(score)  
+}
+validate2 <- function(model,test){
+  ind <- sample(nrow(test),round(nrow(test)/2))
+  test1 <- test[ind,]
+  test2 <- test[-ind,]
+  
+  pred <- predict(model,test1)
+  pred1 <- 1-normalize(as.vector(pred)-as.vector(test1$空腹血糖.2013))
+  pred2 <- predict(model,test2)
+  pred2 <- 1-normalize(as.vector(pred2)-as.vector(test2$空腹血糖.2013))
+  
+  test1 <- data.frame(as.vector(test1$血糖)-as.vector(test1$空腹血糖.2013))#生成第三年到第二年的血糖变化0-1向量
+  colnames(test1)[1] = "var1"
+  test1[test1$var1>0,]<-0#增长
+  test1[test1$var1<0,]<-1#非增
+  test1 <- as.vector(test1)
+  
+  score <- ScoreNormalization(pred1,test1,pred2)
+  return(score)  
+}
+tongji2 <- function(model,test,down=0,up=100){
+  tep <- data.frame(c('下降'))
+  
+  ind <- sample(nrow(test),round(nrow(test)/2))
+  test1 <- test[ind,]
+  test2 <- test[-ind,]
+  test.num <- nrow(test2)
+  tep <- cbind(tep,test.num)
+  test.down <- test2$血糖 - test2$空腹血糖.2013
+  test.down <- length(test.down[test.down<0])
+  tep <- cbind(tep,test.down)
+  
+  pred1 <-  predict(model,test1)
+  pred1 <- 1-normalize(as.vector(pred1)-as.vector(test1$空腹血糖.2013))
+  pred2 <- predict(model,test2)
+  pred2 <- 1-normalize(as.vector(pred2)-as.vector(test2$空腹血糖.2013))
+  
+  test1 <- data.frame(as.vector(test1$血糖)-as.vector(test1$空腹血糖.2013))#生成第三年到第二年的血糖变化0-1向量
+  colnames(test1)[1] = "var1"
+  test1[test1$var1>0,]<-0#增长
+  test1[test1$var1<0,]<-1#非增
+  test1 <- as.vector(test1)
+  
+  
+  score <- ScoreNormalization(pred1,test1,pred2)
+  test2 <- test2[which(score >=down & score <=up),]
+  
+  test80.num <- nrow(test2)
+  tep <- cbind(tep,test80.num)
+  test80.down <- test2$血糖 - test2$空腹血糖.2013
+  test80.down <- length(test80.down[test80.down<0])
+  tep <- cbind(tep,test80.down)
+  
+  sensitivity <- test80.down/test.down
+  specifility <- (test.num+test80.down-test.down-test80.num)/(test.num-test.down)
+  ppv         <- test80.down/test80.num
+  
+  tep <- cbind(tep,sensitivity,specifility,ppv)
+  return(tep)  
+}
+#计算上升的分人群
+tongji <- function(model,test,down=0,up=100){
+  tep <- data.frame(c('上升'))
+  
+  ind <- sample(nrow(test),round(nrow(test)/2))
+  test1 <- test[ind,]
+  test2 <- test[-ind,]
+  test.num <- nrow(test2)
+  tep <- cbind(tep,test.num)
+  test.up <- test2$血糖 - test2$空腹血糖.2014
+  test.up <- length(test.up[test.up>0])
+  tep <- cbind(tep,test.up)
+  
+  pred1 <-  predict(model,test1)
+  pred1 <- normalize(as.vector(pred1)-as.vector(test1$空腹血糖.2014))
+  pred2 <- predict(model,test2)
+  pred2 <- normalize(as.vector(pred2)-as.vector(test2$空腹血糖.2014))
+  
+  test1 <- data.frame(as.vector(test1$血糖)-as.vector(test1$空腹血糖.2014))#生成第三年到第二年的血糖变化0-1向量
+  colnames(test1)[1] = "var1"
+  test1[test1$var1>0,]<-1#增长
+  test1[test1$var1<=0,]<-0#非增
+  test1 <- as.vector(test1)
+  
+  
+  score <- ScoreNormalization(pred1,test1,pred2)
+  test2 <- test2[which(score >=down & score <=up),]
+  
+  test80.num <- nrow(test2)
+  tep <- cbind(tep,test80.num)
+  test80.up <- test2$血糖 - test2$空腹血糖.2014
+  test80.up <- length(test80.up[test80.up>0])
+  tep <- cbind(tep,test80.up)
+  
+  sensitivity <- test80.up/test.up
+  specifility <- (test.num+test80.up-test.up-test80.num)/(test.num-test.up)
+  ppv         <- test80.up/test80.num
+  
+  tep <- cbind(tep,sensitivity,specifility,ppv)
+  print(tep)
+  tep2 <- data.frame(c('下降'))
+  
+  test1 <- test[ind,]
+  test2 <- test[-ind,]
+  test.num <- nrow(test2)
+  tep2 <- cbind(tep2,test.num)
+  test.down <- test2$血糖 - test2$空腹血糖.2014
+  test.down <- length(test.down[test.down<0])
+  tep2 <- cbind(tep2,test.down)
+  
+  pred1 <-  predict(model,test1)
+  pred1 <- 1-normalize(as.vector(pred1)-as.vector(test1$空腹血糖.2014))
+  pred2 <- predict(model,test2)
+  pred2 <- 1-normalize(as.vector(pred2)-as.vector(test2$空腹血糖.2014))
+  
+  test1 <- data.frame(as.vector(test1$血糖)-as.vector(test1$空腹血糖.2014))#生成第三年到第二年的血糖变化0-1向量
+  colnames(test1)[1] = "var1"
+  test1[test1$var1>0,]<-0#增长
+  test1[test1$var1<0,]<-1#非增
+  test1 <- as.vector(test1)
+  
+  
+  score <- ScoreNormalization(pred1,test1,pred2)
+  test2 <- test2[which(score >=down & score <=up),]
+  
+  test80.num <- nrow(test2)
+  tep2 <- cbind(tep2,test80.num)
+  test80.down <- test2$血糖 - test2$空腹血糖.2014
+  test80.down <- length(test80.down[test80.down<0])
+  tep2 <- cbind(tep2,test80.down)
+  
+  sensitivity <- test80.down/test.down
+  specifility <- (test.num+test80.down-test.down-test80.num)/(test.num-test.down)
+  ppv         <- test80.down/test80.num
+  
+  tep2 <- cbind(tep2,sensitivity,specifility,ppv)
+  print(tep2)
+  colnames(tep2)<-colnames(tep)
+  tep  <- rbind(tep,tep2)
+  return(tep)  
+}
+Cols <- function(vec){
+  cols = rainbow(length(unique(vec)))
+  return(cols[as.numeric(as.factor(vec))])
+}
+
+inc_score <- function(model,test,score_data){
+  
+  
+  pred1 <- predict(model,test)
+  pred1 <- normalize(as.vector(pred1)-as.vector(test$空腹血糖.2013))
+  pred2 <- predict(model,score_data)
+  pred2 <- normalize(as.vector(pred2)-as.vector(score_data$空腹血糖.2013))
+  
+  test1 <- data.frame(as.vector(test$血糖)-as.vector(test$空腹血糖.2013))#生成第三年到第二年的血糖变化0-1向量
+  colnames(test1)[1] = "var1"
+  test1[test1$var1>0,]<-1#增长
+  test1[test1$var1<=0,]<-0#非增
+  test1 <- as.vector(test1)
+  
+  
+  
+  score <- ScoreNormalization(pred1,test1,pred2)
+  return(score)  
+}
+dec_score <- function(model,test,score_data){
+  
+  
+  pred1 <- predict(model,test)
+  pred1 <- 1-normalize(as.vector(pred1)-as.vector(test$空腹血糖.2013))
+  pred2 <- predict(model,score_data)
+  pred2 <- 1-normalize(as.vector(pred2)-as.vector(score_data$空腹血糖.2013))
+  
+  test1 <- data.frame(as.vector(test$血糖)-as.vector(test$空腹血糖.2013))#生成第三年到第二年的血糖变化0-1向量
+  colnames(test1)[1] = "var1"
+  test1[test1$var1>0,]<-0#增长
+  test1[test1$var1<0,]<-1#非增
+  test1 <- as.vector(test1)
+  
+  
+  
+  score <- ScoreNormalization(pred1,test1,pred2)
+  return(score)  
+}
+
+#remove features
+remvf <- function(importance){
+  tep<-rownames(importance)
+  sp <- function(tem){
+    x<-unlist(strsplit(tem,'\\.'))[1]
+    return(x)
+  }
+  tep<- cbind(tep,importance)
+  tep <- data.frame(tep)
+  tep[,1]<- as.character(tep[,1])
+  for(i in 1:nrow(tep)){
+    tep[i,1]<-sp(tep[i,1])
+  }
+  tep[,2]<- as.numeric(as.character(tep[,2]))
+  tep[,3]<- as.numeric(as.character(tep[,3]))
+  tep<-aggregate(cbind(tep$X.IncMSE,tep$IncNodePurity)~tep$tep,FUN=mean,na.rm=T)
+  tep <-tep[order(tep[,2],decreasing=T),]
+  return(tep)
+}
+# remove features for some medical examination items
+fs <- function(data,del.set){
+  x <- data
+  con.set <- del.set[which(del.set %in% c('身高','年龄','性别'))]
+  del.set <- del.set[-which(del.set %in% c('身高','年龄','性别'))]
+  if(length(del.set) != 0){
+    for(i in 1:length(del.set)){
+      x[,paste(del.set[i],'2011',sep='.')]<-NULL
+      x[,paste(del.set[i],'2012',sep='.')]<-NULL
+      x[,paste(del.set[i],'2013',sep='.')]<-NULL
+      x[,paste(del.set[i],'2014',sep='.')]<-NULL
+    }
+  }
+  if(length(con.set) != 0)for(i in 1:length(con.set)){
+    x[,con.set[i]]<-NULL
+  }
+  return (x)
+}
+#reduced feature plot for optimal feature set
+rmfplot <- function(data,tep){
+  ind <- sample(nrow(data),(nrow(data)*(2/3)))
+  train.int <- data[ind,]
+  test.int  <- data[-ind,]
+  train <- train.int
+  test  <- test.int
+  
+  train.plot <- c()
+  test.plot  <- c()
+  for(i in 0:(length(tep)-3)){
+    if(i != 0){
+      
+      train <- fs(train.int,tep[(length(tep)-i):length(tep)])
+      test <- fs(test.int,tep[(length(tep)-i):length(tep)])
+    }
+    rfModel <- PrandomForest(3,train[,1:(ncol(train)-1)],train[,ncol(train)],500,F,F)
+    pred <- predict(rfModel,train)
+    pred <- as.vector(pred)-as.vector(train$空腹血糖.2014)#生成预测向量 
+    tem <-as.vector(train$血糖)-as.vector(train$空腹血糖.2014)
+    tem <- zero_one(tem)
+    pred <- prediction(pred, tem)
+    
+    perf.auc <- performance(pred, "auc" )
+    train.plot <- c(train.plot,unlist(perf.auc@y.values))
+    
+    pred <- predict(rfModel,test)
+    pred <- as.vector(pred)-as.vector(test$空腹血糖.2014)#生成预测向量 
+    tem <-as.vector(test$血糖)-as.vector(test$空腹血糖.2014)
+    tem <- zero_one(tem)
+    pred <- prediction(pred, tem)
+    
+    perf.auc <- performance(pred, "auc" )
+    test.plot <- c(test.plot,unlist(perf.auc@y.values))
+  }
+  train.plot <- train.plot[length(train.plot):1]
+  test.plot <- test.plot[length(test.plot):1]
+  plot(train.plot,col='green',xlab='the number of features', ylab = 'AUC-value',xlim = c(0,50),ylim= c(0.7,1),pch=2,type='o', lty = 2,main='features selection')
+  lines(test.plot,col='red',pch=1,type='o',lty=1)
+  abline(h=max(test.plot),lty=2)
+  abline(v=which(test.plot == max(test.plot)),lty=2)
+  legend('right',pch=c(2,1),lty=c(2,1),col=c('green','red'),legend=c('train','test'))
+  return(data.frame(train.plot,test.plot))
+}
+#plot the predictive FBG values and the true FBG values in a probability interval
+resultplot <- function(model,test,down=80,up=100){
+  
+  ind <- sample(nrow(test),round(nrow(test)/2))
+  test1 <- test[ind,]
+  test2 <- test[-ind,]
+  
+  test.up <- test2$血糖 - test2$空腹血糖.2014
+  test.up <- length(test.up[test.up>0])
+  
+  pred1 <-  predict(model,test1)
+  pred1 <- normalize(as.vector(pred1)-as.vector(test1$空腹血糖.2014))
+  pred <- predict(model,test2)
+  pred2 <- normalize(as.vector(pred)-as.vector(test2$空腹血糖.2014))
+  
+  test1 <- data.frame(as.vector(test1$血糖)-as.vector(test1$空腹血糖.2014))#生成第三年到第二年的血糖变化0-1向量
+  colnames(test1)[1] = "var1"
+  test1[test1$var1>0,]<-1#增长
+  test1[test1$var1<=0,]<-0#非增
+  test1 <- as.vector(test1)
+  
+  
+  score <- ScoreNormalization(pred1,test1,pred2)
+  tem <-test2[which(score >=down & score <=up),'空腹血糖.2014']
+  
+  plot(x=1:length(tem),y=tem,col='red',pch=1,xlab='index',ylab='FBG values',xlim=c(1,(length(tem)+4)),ylim=c(3,max(tem)+4))
+  tem <- pred[which(score >=down & score <=up)]
+  points(x=1:length(tem),y=tem,col='green',pch=2)
+  legend("topright", col=c("red","green"), pch=c(1,2), legend=c('FBG value','predictive value') )
+  
+  test1 <- test[ind,]
+  test2 <- test[-ind,]
+  
+  
+  pred1 <-  predict(model,test1)
+  pred1 <- 1-normalize(as.vector(pred1)-as.vector(test1$空腹血糖.2014))
+  pred <- predict(model,test2)
+  pred2 <- 1-normalize(as.vector(pred)-as.vector(test2$空腹血糖.2014))
+  
+  test1 <- data.frame(as.vector(test1$血糖)-as.vector(test1$空腹血糖.2014))#生成第三年到第二年的血糖变化0-1向量
+  colnames(test1)[1] = "var1"
+  test1[test1$var1>0,]<-0#增长
+  test1[test1$var1<0,]<-1#非增
+  test1 <- as.vector(test1)
+  
+  
+  score <- ScoreNormalization(pred1,test1,pred2)
+  tem <-test2[which(score >=down & score <=up),'空腹血糖.2014']
+  
+  plot(x=1:length(tem),y=tem,col='red',pch=1,xlab='index',ylab='FBG values',xlim=c(1,(length(tem)+4)),ylim=c(3,max(tem)+4))
+  tem <- pred[which(score >=down & score <=up)]
+  points(x=1:length(tem),y=tem,col='green',pch=2)
+  legend("topright", col=c("red","green"), pch=c(1,2), legend=c('FBG value','predictive value') )
+  
+}
+
